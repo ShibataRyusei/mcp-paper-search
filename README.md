@@ -40,10 +40,10 @@ Add the following to `~/.gemini/config/mcp_config.json`:
     "paper-search-mcp": {
       "command": "node",
       "args": [
-        "/Users/shibata/Documents/Documents - MacBook Pro/GitHub/mcp-paper-search/node_modules/tsx/dist/cli.mjs",
-        "/Users/shibata/Documents/Documents - MacBook Pro/GitHub/mcp-paper-search/index.ts"
+        "/path/to/mcp-paper-search/node_modules/tsx/dist/cli.mjs",
+        "/path/to/mcp-paper-search/index.ts"
       ],
-      "cwd": "/Users/shibata/Documents/Documents - MacBook Pro/GitHub/mcp-paper-search"
+      "cwd": "/path/to/mcp-paper-search"
     }
   }
 }
