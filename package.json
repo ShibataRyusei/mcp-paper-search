@@ -1,22 +1,21 @@
 {
   "name": "mcp-paper-search",
   "version": "1.0.0",
-  "description": "Custom MCP server for academic paper search (arXiv, Crossref, CiNii) and PDF download",
+  "description": "Remote MCP server for academic paper search (arXiv, Crossref, CiNii) running on Cloudflare Workers",
   "main": "index.ts",
   "type": "module",
   "scripts": {
-    "start": "tsx index.ts",
-    "build": "tsc"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "axios": "^1.7.0",
     "xml2js": "^0.6.2"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/xml2js": "^0.4.14",
-    "tsx": "^4.19.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "wrangler": "^3.0.0"
   }
 }

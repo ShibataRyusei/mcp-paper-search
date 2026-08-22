@@ -1,13 +1,15 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import axios from "axios";
+import { CallToolRequestSchema, ListToolsRequestSchema, JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { parseStringPromise } from "xml2js";
-import fs from "fs";
-import path from "path";
+
+const SERVER_INFO = {
+  name: "mcp-paper-search",
+  version: "1.0.0",
+};
 
 const USER_AGENT = "AntigravityPaperSearch/1.0 (mailto:antigravity@gemini.ai)";
-const TIMEOUT = 7000; // 7 seconds timeout
+const TIMEOUT_MS = 7000;
 
 interface PaperResult {
   source: string;
@@ -23,38 +25,97 @@ interface PaperResult {
   categories?: string[];
 }
 
+const TOOLS_DEFINITIONS = [
+  {
+    name: "paper_search",
+    description: "Search academic research papers across arXiv, Crossref, and CiNii.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Search query keywords (e.g. 'large language model agent' or '人工知能')",
+        },
+        source: {
+          type: "string",
+          enum: ["all", "arxiv", "crossref", "cini"],
+          default: "all",
+          description: "Data source to query",
+        },
+        max_results: {
+          type: "integer",
+          default: 5,
+          description: "Maximum results per source",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "download_paper_pdf",
+    description: "Get direct PDF download URL for an arXiv ID or PDF link.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url_or_id: {
+          type: "string",
+          description: "arXiv ID (e.g. '2402.11651') or direct PDF URL",
+        },
+      },
+      required: ["url_or_id"],
+    },
+  },
+];
+
 /**
- * Search arXiv API for Computer Science, Physics, Math, AI papers
+ * Fetch with timeout using AbortController
+ */
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs: number = TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    clearTimeout(id);
+    return response;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
+}
+
+/**
+ * Search arXiv API
  */
 async function searchArxiv(query: string, maxResults: number): Promise<PaperResult[]> {
   const encodedQuery = encodeURIComponent(query);
   const url = `http://export.arxiv.org/api/query?search_query=all:${encodedQuery}&start=0&max_results=${maxResults}&sortBy=relevance&sortOrder=descending`;
-  
-  try {
-    const response = await axios.get(url, {
-      headers: { "User-Agent": USER_AGENT },
-      timeout: TIMEOUT,
-      responseType: "text",
-    });
 
-    const parsed = await parseStringPromise(response.data);
+  try {
+    const response = await fetchWithTimeout(url, {
+      headers: { "User-Agent": USER_AGENT },
+    });
+    const xmlData = await response.text();
+
+    const parsed = await parseStringPromise(xmlData);
     const entries = parsed.feed?.entry || [];
     const results: PaperResult[] = [];
 
     for (const entry of entries) {
       const rawTitle = Array.isArray(entry.title) ? entry.title[0] : entry.title || "";
       const title = String(rawTitle).replace(/\s+/g, " ").trim();
-      
+
       const rawSummary = Array.isArray(entry.summary) ? entry.summary[0] : entry.summary || "";
       const abstract = String(rawSummary).replace(/\s+/g, " ").trim();
-      
+
       const publishedStr = Array.isArray(entry.published) ? entry.published[0] : entry.published || "";
       const published = String(publishedStr).slice(0, 10);
-      
+
       const entryId = Array.isArray(entry.id) ? entry.id[0] : entry.id || "";
       const arxivId = String(entryId).split("/").pop() || "";
 
-      // Authors
       const authors: string[] = [];
       if (Array.isArray(entry.author)) {
         for (const a of entry.author) {
@@ -63,7 +124,6 @@ async function searchArxiv(query: string, maxResults: number): Promise<PaperResu
         }
       }
 
-      // PDF URL
       let pdfUrl = `https://arxiv.org/pdf/${arxivId}.pdf`;
       if (Array.isArray(entry.link)) {
         for (const link of entry.link) {
@@ -74,7 +134,6 @@ async function searchArxiv(query: string, maxResults: number): Promise<PaperResu
         }
       }
 
-      // Categories
       const categories: string[] = [];
       if (Array.isArray(entry.category)) {
         for (const cat of entry.category) {
@@ -97,25 +156,25 @@ async function searchArxiv(query: string, maxResults: number): Promise<PaperResu
 
     return results;
   } catch (error: any) {
-    console.error(`[arXiv Error] ${error.message}`);
+    console.error(`[arXiv Error] ${error?.message || error}`);
     return [];
   }
 }
 
 /**
- * Search Crossref API for global academic literature & DOIs
+ * Search Crossref API
  */
 async function searchCrossref(query: string, maxResults: number): Promise<PaperResult[]> {
   const encodedQuery = encodeURIComponent(query);
   const url = `https://api.crossref.org/works?query=${encodedQuery}&rows=${maxResults}`;
 
   try {
-    const response = await axios.get(url, {
+    const response = await fetchWithTimeout(url, {
       headers: { "User-Agent": USER_AGENT },
-      timeout: TIMEOUT,
     });
+    const data: any = await response.json();
 
-    const items = response.data?.message?.items || [];
+    const items = data?.message?.items || [];
     const results: PaperResult[] = [];
 
     for (const item of items) {
@@ -123,7 +182,6 @@ async function searchCrossref(query: string, maxResults: number): Promise<PaperR
       const doi = item.DOI || "";
       const paperUrl = item.URL || (doi ? `https://doi.org/${doi}` : "");
 
-      // Authors
       const authors: string[] = [];
       if (Array.isArray(item.author)) {
         for (const a of item.author) {
@@ -132,7 +190,6 @@ async function searchCrossref(query: string, maxResults: number): Promise<PaperR
         }
       }
 
-      // Year
       const publishedObj = item["published-print"] || item["published-online"] || item.created;
       let year = "";
       if (publishedObj?.["date-parts"]?.[0]?.[0]) {
@@ -163,25 +220,25 @@ async function searchCrossref(query: string, maxResults: number): Promise<PaperR
 
     return results;
   } catch (error: any) {
-    console.error(`[Crossref Error] ${error.message}`);
+    console.error(`[Crossref Error] ${error?.message || error}`);
     return [];
   }
 }
 
 /**
- * Search CiNii Research API for Japanese academic papers
+ * Search CiNii Research API
  */
 async function searchCinii(query: string, maxResults: number): Promise<PaperResult[]> {
   const encodedQuery = encodeURIComponent(query);
   const url = `https://ci.nii.ac.jp/books/opensearch/search?q=${encodedQuery}&format=json&count=${maxResults}`;
 
   try {
-    const response = await axios.get(url, {
+    const response = await fetchWithTimeout(url, {
       headers: { "User-Agent": USER_AGENT },
-      timeout: TIMEOUT,
     });
+    const data: any = await response.json();
 
-    const graph = response.data?.["@graph"] || [];
+    const graph = data?.["@graph"] || [];
     const items = Array.isArray(graph) && graph.length > 0 ? graph[0]?.items || [] : [];
     const results: PaperResult[] = [];
 
@@ -215,45 +272,13 @@ async function searchCinii(query: string, maxResults: number): Promise<PaperResu
 
     return results;
   } catch (error: any) {
-    console.error(`[CiNii Error] ${error.message}`);
+    console.error(`[CiNii Error] ${error?.message || error}`);
     return [];
   }
 }
 
 /**
- * Download arXiv paper PDF to local directory
- */
-async function downloadPaperPdf(urlOrId: string, outdir: string): Promise<string | null> {
-  try {
-    fs.mkdirSync(outdir, { recursive: true });
-
-    let pdfUrl = urlOrId;
-    let filename = urlOrId.split("/").pop() || "paper.pdf";
-
-    if (!urlOrId.startsWith("http")) {
-      pdfUrl = `https://arxiv.org/pdf/${urlOrId}.pdf`;
-      filename = `${urlOrId}.pdf`;
-    } else if (!filename.endsWith(".pdf")) {
-      filename += ".pdf";
-    }
-
-    const targetPath = path.join(outdir, filename);
-    const response = await axios.get(pdfUrl, {
-      headers: { "User-Agent": USER_AGENT },
-      responseType: "arraybuffer",
-      timeout: 30000,
-    });
-
-    fs.writeFileSync(targetPath, Buffer.from(response.data));
-    return path.resolve(targetPath);
-  } catch (error: any) {
-    console.error(`[PDF Download Error] ${error.message}`);
-    return null;
-  }
-}
-
-/**
- * Format search results as Github-style Markdown
+ * Format search results into Markdown
  */
 function formatMarkdown(results: PaperResult[], query: string): string {
   const lines: string[] = [
@@ -296,75 +321,10 @@ function formatMarkdown(results: PaperResult[], query: string): string {
   return lines.join("\n");
 }
 
-// Set up Stdio MCP Server
-const server = new Server(
-  {
-    name: "paper-search-mcp",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
-
-// Define Tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "paper_search",
-        description: "Search academic research papers across arXiv, Crossref, and CiNii.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Search query keywords (e.g. 'large language model agent' or '人工知能')",
-            },
-            source: {
-              type: "string",
-              enum: ["all", "arxiv", "crossref", "cini"],
-              default: "all",
-              description: "Data source to query",
-            },
-            max_results: {
-              type: "integer",
-              default: 5,
-              description: "Maximum results per source",
-            },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        name: "download_paper_pdf",
-        description: "Download paper PDF from arXiv ID or PDF URL to local workspace.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            url_or_id: {
-              type: "string",
-              description: "arXiv ID (e.g. '2402.11651') or direct PDF URL",
-            },
-            outdir: {
-              type: "string",
-              default: "./downloads",
-              description: "Output directory for the PDF",
-            },
-          },
-          required: ["url_or_id"],
-        },
-      },
-    ],
-  };
-});
-
-// Implement Tool Calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
+/**
+ * Tool execution handler
+ */
+async function handleToolCall(name: string, args: any): Promise<any> {
   if (name === "paper_search") {
     const query = String(args?.query || "");
     const source = String(args?.source || "all");
@@ -386,44 +346,212 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     const markdown = formatMarkdown(results, query);
-
     return {
-      content: [
-        {
-          type: "text",
-          text: markdown,
-        },
-      ],
+      content: [{ type: "text", text: markdown }],
     };
   }
 
   if (name === "download_paper_pdf") {
     const urlOrId = String(args?.url_or_id || "");
-    const outdir = String(args?.outdir || "./downloads");
-
-    const downloadedPath = await downloadPaperPdf(urlOrId, outdir);
-
+    let pdfUrl = urlOrId;
+    if (!urlOrId.startsWith("http")) {
+      pdfUrl = `https://arxiv.org/pdf/${urlOrId}.pdf`;
+    }
     return {
       content: [
         {
           type: "text",
-          text: downloadedPath
-            ? `Successfully downloaded PDF to: ${downloadedPath}`
-            : `Failed to download PDF from: ${urlOrId}`,
+          text: `Direct PDF link for ${urlOrId}: ${pdfUrl}`,
         },
       ],
     };
   }
 
   throw new Error(`Unknown tool: ${name}`);
-});
-
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error("Server execution error:", err);
-  process.exit(1);
-});
+function createMcpServer(): Server {
+  const server = new Server(SERVER_INFO, { capabilities: { tools: {} } });
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return { tools: TOOLS_DEFINITIONS };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    return await handleToolCall(request.params.name, request.params.arguments);
+  });
+
+  return server;
+}
+
+// Web Worker SSE Transport for Cloudflare Workers
+class WebWorkerSSEServerTransport implements Transport {
+  private controller: ReadableStreamDefaultController<Uint8Array>;
+  private encoder = new TextEncoder();
+  public onclose?: () => void;
+  public onerror?: (error: Error) => void;
+  public onmessage?: (message: JSONRPCMessage) => void;
+
+  constructor(controller: ReadableStreamDefaultController<Uint8Array>) {
+    this.controller = controller;
+  }
+
+  async start(): Promise<void> {}
+
+  async close(): Promise<void> {
+    try {
+      this.controller.close();
+    } catch {}
+    this.onclose?.();
+  }
+
+  async send(message: JSONRPCMessage): Promise<void> {
+    const data = `event: message\ndata: ${JSON.stringify(message)}\n\n`;
+    try {
+      this.controller.enqueue(this.encoder.encode(data));
+    } catch {}
+  }
+
+  async handleIncomingMessage(message: JSONRPCMessage): Promise<void> {
+    if (this.onmessage) {
+      this.onmessage(message);
+    }
+  }
+}
+
+const sessions = new Map<string, { transport: WebWorkerSSEServerTransport; server: Server }>();
+
+// Direct HTTP JSON-RPC handler for stateless validation (Gemini Spark / HTTP Clients)
+async function processDirectJsonRpc(body: any): Promise<any> {
+  const { method, params, id } = body;
+
+  if (method === "initialize") {
+    return {
+      jsonrpc: "2.0",
+      id: id ?? 0,
+      result: {
+        protocolVersion: params?.protocolVersion || "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: SERVER_INFO,
+      },
+    };
+  }
+
+  if (method === "tools/list") {
+    return {
+      jsonrpc: "2.0",
+      id: id ?? 0,
+      result: { tools: TOOLS_DEFINITIONS },
+    };
+  }
+
+  if (method === "tools/call") {
+    try {
+      const result = await handleToolCall(params?.name, params?.arguments);
+      return { jsonrpc: "2.0", id: id ?? 0, result };
+    } catch (err: any) {
+      return {
+        jsonrpc: "2.0",
+        id: id ?? 0,
+        error: { code: -32603, message: err?.message || "Execution error" },
+      };
+    }
+  }
+
+  if (method === "ping") {
+    return { jsonrpc: "2.0", id: id ?? 0, result: {} };
+  }
+
+  return { jsonrpc: "2.0", id: id ?? null, result: {} };
+}
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+  "Access-Control-Allow-Headers": "*",
+};
+
+export default {
+  async fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    // Return 404 for OAuth discovery requests (tells client no auth is required)
+    if (url.pathname.startsWith("/.well-known/")) {
+      return new Response("Not Found", { status: 404, headers: corsHeaders });
+    }
+
+    // 1. GET /sse or GET / -> Initialize SSE Stream
+    if (request.method === "GET" && (url.pathname === "/sse" || url.pathname === "/")) {
+      const sessionId = crypto.randomUUID();
+      let streamController: ReadableStreamDefaultController<Uint8Array>;
+
+      const stream = new ReadableStream({
+        start(controller) {
+          streamController = controller;
+          const endpointUrl = `${url.origin}/message?sessionId=${sessionId}`;
+          const endpointMessage = `event: endpoint\ndata: ${endpointUrl}\n\n`;
+          controller.enqueue(new TextEncoder().encode(endpointMessage));
+        },
+        cancel() {
+          sessions.delete(sessionId);
+        },
+      });
+
+      const transport = new WebWorkerSSEServerTransport(streamController!);
+      const server = createMcpServer();
+
+      sessions.set(sessionId, { transport, server });
+      ctx.waitUntil(server.connect(transport));
+
+      return new Response(stream, {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
+    }
+
+    // 2. POST -> Session SSE message or Stateless Direct JSON-RPC
+    if (request.method === "POST") {
+      const sessionId = url.searchParams.get("sessionId");
+      let body: any;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response("Invalid JSON", { status: 400, headers: corsHeaders });
+      }
+
+      if (sessionId && sessions.has(sessionId)) {
+        const session = sessions.get(sessionId)!;
+        await session.transport.handleIncomingMessage(body);
+        return new Response("Accepted", { status: 202, headers: corsHeaders });
+      }
+
+      // Stateless fallback for discovery validation
+      try {
+        const responseJson = await processDirectJsonRpc(body);
+        return new Response(JSON.stringify(responseJson), {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: body?.id ?? null,
+            error: { code: -32603, message: err?.message || "Internal error" },
+          }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+    }
+
+    return new Response("Not Found", { status: 404, headers: corsHeaders });
+  },
+};
